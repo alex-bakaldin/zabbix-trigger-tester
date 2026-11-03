@@ -15,7 +15,7 @@ START = 1_700_000_000
 class FakeAPI:
     instances = []
 
-    def __init__(self, url, token=None, verify=True, timeout=60):
+    def __init__(self, url, token=None, verify=True, timeout=60, **options):
         self.url = url
         self.token = token
         self.calls = []
@@ -51,7 +51,8 @@ class FakeAPI:
         )
 
     def find_item(self, host, key):
-        return None
+        self.calls.append(("find_item", host, key))
+        return self.get_trigger("555").item_by_ref(host, key)
 
     def get_history(self, item, time_from, time_till):
         self.calls.append(("history", time_from, time_till))
@@ -83,7 +84,9 @@ def fake_api(monkeypatch):
 
 
 def run_cli(*extra):
-    argv = ["--url", "http://zbx", "--token", "x", "-t", "555", "--from", str(START), "--till", str(START + 7 * 60), "--tz", "UTC"]
+    argv = ["--url", "http://zbx", "--token", "x", "--from", str(START), "--till", str(START + 7 * 60), "--tz", "UTC"]
+    if not any(a == "--expression" for a in extra):
+        argv += ["-t", "555"]
     if not any(a == "--engine" for a in extra):
         argv += ["--engine", "python"]
     return cli.main(argv + list(extra))
@@ -110,13 +113,37 @@ def test_end_to_end(capsys, tmp_path, engine):
     assert "logout" in api.calls
 
 
-def test_expression_override_and_verbose(capsys):
+def test_adhoc_expression_and_verbose(capsys):
     code = run_cli("--expression", "last(/srv1/system.cpu.util)>{$LIMIT}", "--macro", "LIMIT=50", "-v", "--step", "0")
     out = capsys.readouterr().out
     assert code == 0
-    assert "Expression (override)" in out
+    assert "Ad-hoc expression (no trigger)" in out and "hosts: srv1" in out and "recovery mode: expression" in out
     assert "last(/srv1/system.cpu.util) > 50" in out
     assert out.count("\n*") == 4  # OK->P, P->OK, OK->P, P->OK
+    api = FakeAPI.instances[0]
+    assert ("find_item", "srv1", "system.cpu.util") in api.calls
+    assert not any(c[0] == "trigger" for c in api.calls if isinstance(c, tuple))
+
+
+def test_adhoc_recovery_expression(capsys, tmp_path):
+    out_file = tmp_path / "res.json"
+    code = run_cli("--expression", "last(/srv1/system.cpu.util)>90", "--recovery-expression", "last(/srv1/system.cpu.util)<10",
+                   "--step", "0", "--json", str(out_file))
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "recovery mode: recovery expression" in out
+    data = json.loads(out_file.read_text())
+    assert data["trigger"]["triggerid"] is None and data["trigger"]["recovery_mode"] == 1
+    assert data["trigger"]["recovery_expression"] == "last(/srv1/system.cpu.util) < 10"
+
+
+def test_trigger_and_expression_are_exclusive(capsys):
+    base = ["--url", "http://zbx", "--token", "x"]
+    assert cli.main(base + ["-t", "1", "--expression", "last(/a/b)>1"]) == 2
+    assert "not both" in capsys.readouterr().err
+    assert cli.main(base) == 2
+    assert cli.main(base + ["-t", "1", "--recovery-expression", "last(/a/b)<1"]) == 2
+    assert cli.main(base + ["--expression", "last(/a/b)>1", "--compare-events"]) == 2
 
 
 def test_unresolved_macro_reported(capsys):

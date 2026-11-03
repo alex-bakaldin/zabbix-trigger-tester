@@ -55,9 +55,13 @@ zbx-trigger-test -t 23456
 # explicit period, compare with real events, show every evaluation
 zbx-trigger-test -t 23456 --from "2026-11-01 00:00" --till "2026-11-02 00:00" --compare-events -v
 
-# what-if: another expression on the same items
-zbx-trigger-test -t 23456 --period 7d \
+# what-if: an expression that is not a trigger yet (items are looked up by /host/key)
+zbx-trigger-test --period 7d \
     --expression 'min(/srv1/system.cpu.util,10m)>{$CPU.MAX}' --macro '{$CPU.MAX}=85'
+
+# ... with hysteresis: the ad-hoc trigger recovers by a recovery expression
+zbx-trigger-test --period 7d --expression 'last(/srv1/system.cpu.util)>90' \
+    --recovery-expression 'last(/srv1/system.cpu.util)<70'
 
 # machine readable output for further analysis / visualisation
 zbx-trigger-test -t 23456 --json result.json
@@ -67,8 +71,9 @@ zbx-trigger-test -t 23456 --json result.json
 |---|---|
 | `-t/--trigger` | trigger ID |
 | `--from`, `--till`, `--period` | period: ISO date/time, unix time, `now-1d`, `now/d` |
-| `--step` | interval of timer evaluations; `auto` = 30 s when the trigger has `nodata()`, `now()`, trend functions or time shifts |
-| `--expression`, `--recovery-expression` | override the expressions (Zabbix syntax with `/host/key` references) |
+| `--chunk`, `--page-size` | history is fetched in time windows (default `6h`, `0` = whole period) and pages of at most N rows (default 10000) per `history.get`, so no single request is large |
+| `--step` | interval of timer evaluations; `auto` = 30 s when either expression has `nodata()`, `date()/time()/now()/dayofweek()/dayofmonth()` or trend/baseline functions (time shifts alone do not make the server re-evaluate) |
+| `--expression`, `--recovery-expression` | replay an ad-hoc expression instead of a trigger (Zabbix syntax with `/host/key` references); exactly one of `-t` and `--expression` must be given. A recovery expression is optional and switches the ad-hoc trigger to the "recovery expression" mode |
 | `--macro {$NAME}=VALUE` | value for a user macro the API left unresolved |
 | `--initial-state` | trigger state at the period start; `auto` uses the last event before the period |
 | `--compare-events` | fetch the real events of the period and match them with the simulated transitions |
@@ -113,11 +118,23 @@ Summary:
    `history.get` in pages, trends with `trend.get`.
 3. Evaluation points are every new value of any involved item inside the
    period, plus a timer grid for time-based functions. At each point the
-   expression (and the recovery expression) is evaluated by the engine and fed
-   to the trigger state machine with the trigger's recovery mode and event
-   generation mode. Failed functions make the trigger UNKNOWN and keep its
-   previous state; the three-valued logic (`1 or UNKNOWN = 1`,
-   `0 and UNKNOWN = 0`) is the server's.
+   trigger is recalculated the way `zbx_evaluate_expressions()` does it:
+   - the problem expression is evaluated first; if it is true the trigger
+     becomes PROBLEM, but only when the recalculation was started by a value
+     of an item used in the problem expression or by a timer of that
+     expression. A value of an item that appears only in the recovery
+     expression, or a timer that exists only because of the recovery
+     expression, can never raise PROBLEM (the report counts such moments as
+     "problem results ignored");
+   - the recovery expression is consulted only when the trigger is in
+     PROBLEM, recovers by a recovery expression and the problem expression is
+     false. Its errors matter only then;
+   - timer points are evaluated when the problem expression has time-based
+     functions, or while the trigger is in PROBLEM and its recovery expression
+     has them. The grid is aligned like the server's (`30 * k + seed % 30`).
+   Failed functions make the trigger UNKNOWN and keep its previous state; the
+   three-valued logic (`1 or UNKNOWN = 1`, `0 and UNKNOWN = 0`) is the
+   server's.
 
 ### Engines
 
@@ -138,9 +155,13 @@ Summary:
   `nodata()` with proxy suppression windows.
 - Python engine only: `trendstl()`, `jsonpath()`, `xmlpath()` are missing.
 - How far back you can test is bounded by the history retention of the items.
-- The moment of timer evaluations is approximated (server timers are not
-  aligned), so transitions caused by `nodata()`-style functions may be off by
-  up to the step.
+- Trend and baseline functions are re-evaluated by the server on their own
+  hourly schedule; the tester uses the 30 s grid for them too, so such
+  transitions may show up earlier than on the server (never later).
+- Values of several items that arrive with the same timestamp are evaluated
+  once, together. The server may split them across history-syncer batches
+  and evaluate the trigger twice, each time with a partial set of fresh
+  values; such transient flaps cannot be reconstructed from the API.
 - Real events can differ from the simulation because of maintenance periods,
   trigger dependencies, manual closing, correlation or edits to the trigger.
   `--compare-events` lists such mismatches explicitly.

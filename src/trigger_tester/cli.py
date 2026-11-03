@@ -15,9 +15,10 @@ from trigger_tester.api import ZabbixAPI, ZabbixAPIError
 from trigger_tester.binder import BindError, bind
 from trigger_tester.expression.evaluator import EvalContext, Evaluator
 from trigger_tester.expression.parser import ParseError, parse_expression, substitute_macros
-from trigger_tester.expression.period import PeriodError
+from trigger_tester.expression.period import PeriodError, parse_duration
 from trigger_tester.expression.ast import to_text
 from trigger_tester.history import Series, TrendSeries
+from trigger_tester.model import Trigger
 from trigger_tester.native import NativeEngine, NativeError, NativeEvaluator, NativeParseError
 from trigger_tester.report import Reporter, build_json, format_duration, write_json
 from trigger_tester.simulator import OK, PROBLEM, Simulator, build_points
@@ -44,15 +45,19 @@ def build_parser() -> argparse.ArgumentParser:
     conn.add_argument("--password", default=os.environ.get("ZABBIX_PASSWORD"), help="password (env ZABBIX_PASSWORD)")
     conn.add_argument("--insecure", action="store_true", help="skip TLS certificate verification")
     conn.add_argument("--timeout", type=float, default=60, help="HTTP timeout, seconds")
+    conn.add_argument("--chunk", default="6h", metavar="DURATION",
+            help="fetch history in time windows of this length to keep requests small (0 = whole period at once)")
+    conn.add_argument("--page-size", type=int, default=10000, metavar="N",
+            help="maximum rows per history.get request inside a window")
 
     what = parser.add_argument_group("what to test")
-    what.add_argument("-t", "--trigger", required=True, help="trigger ID")
+    what.add_argument("-t", "--trigger", help="trigger ID to replay (either this or --expression)")
     what.add_argument("--from", dest="time_from", help="period start: ISO date/time, unix ts, now-1d, now/d ...")
     what.add_argument("--till", dest="time_till", default="now", help="period end")
     what.add_argument("--period", default="1d", help="period length, used when --from is omitted")
     what.add_argument("--step", default="auto", help="timer evaluation interval (e.g. 30s); auto = 30s when the trigger has time-based functions; 0 = off")
-    what.add_argument("--expression", help="evaluate this expression instead of the trigger's one (Zabbix syntax, /host/key references)")
-    what.add_argument("--recovery-expression", help="override the recovery expression")
+    what.add_argument("--expression", help="replay an ad-hoc expression instead of a trigger (Zabbix syntax, /host/key references)")
+    what.add_argument("--recovery-expression", help="recovery expression for --expression; the ad-hoc trigger then recovers by it")
     what.add_argument("--macro", action="append", default=[], metavar="{$NAME}=VALUE", help="value for a user macro left unresolved in the expression (repeatable)")
     what.add_argument("--initial-state", choices=["auto", "ok", "problem"], default="auto", help="trigger state at period start; auto = taken from the last event before the period")
     what.add_argument("--compare-events", action="store_true", help="fetch real trigger events for the period and compare")
@@ -125,7 +130,6 @@ def run(args: argparse.Namespace) -> int:
         if args.time_from:
             time_from = parse_time(args.time_from, tz, now)
         else:
-            from trigger_tester.expression.period import parse_duration
 
             time_from = time_till - parse_duration(args.period)
         step = parse_step(args.step)
@@ -135,7 +139,14 @@ def run(args: argparse.Namespace) -> int:
         raise CliError("--from must be earlier than --till")
     macros = _parse_macros(args.macro)
 
-    api = ZabbixAPI(args.url, token=args.token, verify=not args.insecure, timeout=args.timeout)
+    try:
+        chunk_seconds = 0 if args.chunk.strip() == "0" else parse_duration(args.chunk)
+    except (PeriodError, ValueError) as exc:
+        raise CliError(f"--chunk: {exc}") from None
+    if args.page_size < 1:
+        raise CliError("--page-size must be positive")
+    api = ZabbixAPI(args.url, token=args.token, verify=not args.insecure, timeout=args.timeout,
+            page_size=args.page_size, chunk_seconds=chunk_seconds)
     reporter = Reporter(sys.stdout, tz, args.verbose)
     try:
         version = api.version()
@@ -144,20 +155,17 @@ def run(args: argparse.Namespace) -> int:
         if not args.token:
             api.login(args.user, args.password)
 
-        trigger = api.get_trigger(args.trigger)
-        if trigger.status != 0:
-            print("warning: trigger is disabled in Zabbix", file=sys.stderr)
+        if args.trigger:
+            trigger = api.get_trigger(args.trigger)
+            if trigger.status != 0:
+                print("warning: trigger is disabled in Zabbix", file=sys.stderr)
+        else:
+            trigger = _adhoc_trigger(args.expression, args.recovery_expression)
 
         overrides: dict[str, str] = {}
-        expression_text = args.expression or trigger.expanded_expression or trigger.expression
-        if args.expression:
-            overrides["expression"] = args.expression
-        recovery_text = args.recovery_expression or trigger.expanded_recovery_expression or trigger.recovery_expression
-        if args.recovery_expression:
-            overrides["recovery"] = args.recovery_expression
+        expression_text = trigger.expanded_expression or trigger.expression
+        recovery_text = trigger.expanded_recovery_expression or trigger.recovery_expression
         recovery_mode = trigger.recovery_mode
-        if args.recovery_expression and recovery_mode != 1:
-            recovery_mode = 1
         if recovery_mode == 1 and not recovery_text:
             raise CliError("trigger uses recovery expression mode but has no recovery expression")
 
@@ -173,6 +181,9 @@ def run(args: argparse.Namespace) -> int:
             binding = bind(expression, recovery, trigger, api.find_item)
         except BindError as exc:
             raise CliError(str(exc)) from None
+        if not trigger.triggerid:
+            trigger.items = dict(binding.items)
+            trigger.hosts = {item.hostid: item.host for item in binding.items.values()}
 
         if step == -1:
             step = DEFAULT_TIMER_STEP if binding.has_timer_functions else None
@@ -192,14 +203,22 @@ def run(args: argparse.Namespace) -> int:
         initial_state = OK
         if args.initial_state == "problem":
             initial_state = PROBLEM
-        elif args.initial_state == "auto":
+        elif args.initial_state == "auto" and trigger.triggerid:
             last_event = api.get_last_event_before(trigger.triggerid, time_from)
             if last_event is not None and last_event["value"] == 1:
                 initial_state = PROBLEM
 
         events = api.get_trigger_events(trigger.triggerid, time_from, time_till) if args.compare_events else None
     except ZabbixAPIError as exc:
-        raise CliError(f"Zabbix API error: {exc}") from None
+        hint = ""
+        if "Not authorized" in exc.data and api.token:
+            hint = (
+                "\n  The API accepted the credentials but then rejected the Authorization header. "
+                "Usually the web server strips it before PHP sees it: with Apache and php-fpm add "
+                "`CGIPassAuth On` (or `SetEnvIf Authorization \"(.*)\" HTTP_AUTHORIZATION=$1`) "
+                "to the Zabbix frontend configuration and reload Apache."
+            )
+        raise CliError(f"Zabbix API error: {exc}{hint}") from None
     finally:
         api.logout()
 
@@ -230,7 +249,7 @@ def run(args: argparse.Namespace) -> int:
     else:
         evaluator = Evaluator(EvalContext(series=series, trends=trends, tz=tz))
         engine_desc = "pure Python implementation (reduced fidelity)"
-    points = build_points(list(series.values()), time_from, time_till, step)
+    points = build_points(list(series.values()), time_from, time_till, step, binding.timer_seed)
     if not points:
         reporter.line()
         reporter.line("No evaluation points: items have no values in the period and no timer step is set.")
@@ -242,6 +261,9 @@ def run(args: argparse.Namespace) -> int:
         recovery_mode=recovery_mode,
         multiple_problem_events=trigger.type == 1,
         initial_state=initial_state,
+        problem_itemids=binding.problem_itemids,
+        timer_in_expression=binding.timer_in_expression,
+        timer_in_recovery=binding.timer_in_recovery,
     )
     result = simulator.run(points)
 
@@ -265,10 +287,36 @@ def _native_text(node, source: str) -> str:
     return to_text(node)
 
 
+def _adhoc_trigger(expression: str, recovery_expression: str | None) -> Trigger:
+    """A trigger object for --expression runs: recovers by the recovery expression when one is given."""
+    return Trigger(
+        triggerid="",
+        description="ad-hoc expression",
+        expression=expression,
+        recovery_expression=recovery_expression or "",
+        expanded_expression=expression,
+        expanded_recovery_expression=recovery_expression or "",
+        recovery_mode=1 if recovery_expression else 0,
+        type=0,
+        priority=0,
+        status=0,
+    )
+
+
+def _validate_args(args: argparse.Namespace) -> None:
+    if bool(args.trigger) == bool(args.expression):
+        raise CliError("specify either -t/--trigger or --expression, not both")
+    if args.recovery_expression and not args.expression:
+        raise CliError("--recovery-expression needs --expression")
+    if args.expression and args.compare_events:
+        raise CliError("--compare-events needs a real trigger (-t); an ad-hoc expression has no events")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
+        _validate_args(args)
         return run(args)
     except CliError as exc:
         print(f"error: {exc}", file=sys.stderr)

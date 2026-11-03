@@ -71,7 +71,8 @@ def truthy(value: Any) -> bool | None:
     number = to_number(value)
     if number is None:
         return None
-    return number != 0
+    # zbx_evaluate_expressions(): SUCCEED != zbx_double_compare(expr_result, 0.0)
+    return not doubles_equal(float(number), 0.0)
 
 
 def format_value(value: Any) -> str:

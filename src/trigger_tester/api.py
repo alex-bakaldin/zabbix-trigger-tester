@@ -16,6 +16,7 @@ log = logging.getLogger(__name__)
 
 ITEM_OUTPUT = ["itemid", "hostid", "name", "key_", "value_type", "delay", "units", "history", "trends", "status", "state"]
 HISTORY_PAGE = 10000
+HISTORY_CHUNK = 6 * 3600
 
 
 class ZabbixAPIError(Exception):
@@ -27,13 +28,25 @@ class ZabbixAPIError(Exception):
 
 
 class ZabbixAPI:
-    def __init__(self, url: str, token: str | None = None, verify: bool = True, timeout: float = 60) -> None:
+    def __init__(
+        self,
+        url: str,
+        token: str | None = None,
+        verify: bool = True,
+        timeout: float = 60,
+        page_size: int = HISTORY_PAGE,
+        chunk_seconds: int = HISTORY_CHUNK,
+    ) -> None:
         url = url.rstrip("/")
         if not url.endswith("api_jsonrpc.php"):
             url += "/api_jsonrpc.php"
         self.url = url
         self.token = token
         self.timeout = timeout
+        #: history is requested in time windows of chunk_seconds (0 = whole period at once),
+        #: each window in pages of page_size rows, so a single request never pulls more than that
+        self.page_size = max(1, int(page_size))
+        self.chunk_seconds = max(0, int(chunk_seconds))
         self.session = requests.Session()
         self.session.verify = verify
         self._id = 0
@@ -108,7 +121,7 @@ class ZabbixAPI:
         hosts = {str(h["hostid"]): h["host"] for h in row.get("hosts", [])}
         items = {str(i["itemid"]): Item.from_api(i, hosts) for i in row.get("items", [])}
         functions = {
-            str(f["functionid"]): TriggerFunction(str(f["functionid"]), str(f["itemid"]), f["name"], f.get("parameter", ""))
+            str(f["functionid"]): TriggerFunction(str(f["functionid"]), str(f["itemid"]), f["function"], f.get("parameter", ""))
             for f in row.get("functions", [])
         }
         return Trigger(
@@ -143,7 +156,16 @@ class ZabbixAPI:
 
     # --- data -------------------------------------------------------------
     def get_history(self, item: Item, time_from: int, time_till: int) -> list[Point]:
+        """Fetch history in bounded requests: time chunks, each paged by row count."""
         points: dict[tuple[int, int], Point] = {}
+        chunk_start = time_from
+        while chunk_start <= time_till:
+            chunk_till = time_till if not self.chunk_seconds else min(time_till, chunk_start + self.chunk_seconds - 1)
+            self._get_history_pages(item, chunk_start, chunk_till, points)
+            chunk_start = chunk_till + 1
+        return list(points.values())
+
+    def _get_history_pages(self, item: Item, time_from: int, time_till: int, points: dict[tuple[int, int], Point]) -> None:
         cursor = time_from
         while True:
             rows = self.call(
@@ -156,7 +178,7 @@ class ZabbixAPI:
                     "time_till": time_till,
                     "sortfield": "clock",
                     "sortorder": "ASC",
-                    "limit": HISTORY_PAGE,
+                    "limit": self.page_size,
                 },
             )
             new = 0
@@ -165,14 +187,13 @@ class ZabbixAPI:
                 if point.key not in points:
                     points[point.key] = point
                     new += 1
-            if len(rows) < HISTORY_PAGE or new == 0:
+            if len(rows) < self.page_size or new == 0:
                 break
             last_clock = int(rows[-1]["clock"])
             if last_clock == cursor:
                 # More than a page within one second - cannot paginate by clock.
                 break
             cursor = last_clock
-        return list(points.values())
 
     def get_history_before(self, item: Item, before_clock: int, count: int) -> list[Point]:
         if count <= 0:

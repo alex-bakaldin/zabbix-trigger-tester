@@ -66,14 +66,18 @@ class Reporter:
         engine: str = "pure Python implementation (reduced fidelity)",
     ) -> None:
         host_names = ", ".join(sorted(trigger.hosts.values())) or "-"
-        status = "enabled" if trigger.status == 0 else "DISABLED"
-        self.line(f"Trigger #{trigger.triggerid}: {trigger.description}")
-        self.line(f"  hosts: {host_names}   severity: {trigger.priority_name}   status: {status}")
-        self.line(
-            f"  recovery mode: {trigger.recovery_mode_name}   "
-            f"problem events: {'multiple' if trigger.type == 1 else 'single'}   "
-            f"current value: {'PROBLEM' if trigger.value == 1 else 'OK'}"
-        )
+        if trigger.triggerid:
+            status = "enabled" if trigger.status == 0 else "DISABLED"
+            self.line(f"Trigger #{trigger.triggerid}: {trigger.description}")
+            self.line(f"  hosts: {host_names}   severity: {trigger.priority_name}   status: {status}")
+            self.line(
+                f"  recovery mode: {trigger.recovery_mode_name}   "
+                f"problem events: {'multiple' if trigger.type == 1 else 'single'}   "
+                f"current value: {'PROBLEM' if trigger.value == 1 else 'OK'}"
+            )
+        else:
+            self.line("Ad-hoc expression (no trigger)")
+            self.line(f"  hosts: {host_names}   recovery mode: {trigger.recovery_mode_name}   problem events: single")
         expr_label = "Expression (override)" if "expression" in overrides else "Expression"
         self.line(f"{expr_label}:")
         self.line(f"  {to_text(binding.expression)}")
@@ -134,6 +138,8 @@ class Reporter:
         mark = "*" if ev.changed else ("?" if ev.unknown else " ")
         value = format_value(ev.value)
         extra = f" recovery={format_value(ev.recovery_value)}" if ev.recovery_value is not None else ""
+        if ev.suppressed:
+            extra += " [true, but PROBLEM not allowed for this recalculation]"
         source = "timer" if ev.source == "timer" else "value"
         self.line(f"{mark} {format_ts(ev.clock, self.tz)}  {ev.state:<8} [{source}] expr={value}{extra}  {_functions_text(ev)}")
         if ev.errors and self.verbose > 1:
@@ -152,6 +158,11 @@ class Reporter:
         self.line("Summary:")
         self.line(f"  evaluations: {len(result.evaluations)}, unknown: {result.unknown_count}")
         self.line(f"  problem events: {result.problem_events}, recovery events: {result.ok_events}")
+        if result.suppressed_count:
+            self.line(
+                f"  problem results ignored: {result.suppressed_count} "
+                "(recalculation started by a recovery-expression item or timer; the server does not raise PROBLEM then)"
+            )
         if intervals:
             longest = max(durations)
             share = 100.0 * total / max(1, time_till - time_from)
@@ -226,7 +237,7 @@ def build_json(
     return {
         "engine": engine,
         "trigger": {
-            "triggerid": trigger.triggerid,
+            "triggerid": trigger.triggerid or None,
             "description": trigger.description,
             "expression": to_text(binding.expression),
             "recovery_expression": to_text(binding.recovery) if binding.recovery is not None else None,
@@ -257,6 +268,7 @@ def build_json(
                 "itemids": list(ev.itemids),
                 "value": _json_value(ev.value),
                 "recovery_value": _json_value(ev.recovery_value),
+                "suppressed": ev.suppressed,
                 "state": ev.state,
                 "unknown": ev.unknown,
                 "event": ev.event,

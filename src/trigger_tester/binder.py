@@ -39,8 +39,25 @@ class Binding:
     recovery: Node | None
     items: dict[str, Item] = field(default_factory=dict)
     requirements: dict[str, ItemRequirements] = field(default_factory=dict)
-    has_timer_functions: bool = False
+    #: items referenced by the problem expression; only their values may raise PROBLEM
+    #: (zbx_determine_items_in_expressions / ZBX_DC_TRIGGER_PROBLEM_EXPRESSION)
+    problem_itemids: set[str] = field(default_factory=set)
+    #: time-based functions (nodata, trend*, baseline*, date/time/now/dayof*) per expression
+    timer_in_expression: bool = False
+    timer_in_recovery: bool = False
+    #: seed the server spreads the 30 s timer grid with (triggerid or nodata functionid)
+    timer_seed: int | None = None
     warnings: list[str] = field(default_factory=list)
+
+    @property
+    def has_timer_functions(self) -> bool:
+        return self.timer_in_expression or self.timer_in_recovery
+
+    def mark_timer(self, in_recovery: bool) -> None:
+        if in_recovery:
+            self.timer_in_recovery = True
+        else:
+            self.timer_in_expression = True
 
     @property
     def history_calls(self) -> list[HistoryCall]:
@@ -59,13 +76,14 @@ def bind(
     expression = _replace_funcids(expression, trigger)
     recovery = _replace_funcids(recovery, trigger) if recovery is not None else None
     binding = Binding(expression, recovery)
-    for node in binding.history_calls:
-        _bind_call(node, trigger, resolver, binding)
-    for root in (expression, recovery):
+    trigger_timer = False
+    for root, in_recovery in ((expression, False), (recovery, True)):
         if root is None:
             continue
         for node in walk(root):
-            if isinstance(node, MathCall):
+            if isinstance(node, HistoryCall):
+                _bind_call(node, trigger, resolver, binding, in_recovery)
+            elif isinstance(node, MathCall):
                 spec = MATH_FUNCTIONS.get(node.name)
                 if spec is None:
                     if node.name in UNSUPPORTED_MATH_FUNCTIONS:
@@ -74,7 +92,17 @@ def bind(
                         raise BindError(f"{node.text}: first argument must be an item reference /host/key")
                     raise BindError(f"unknown function {node.name}()")
                 if spec.timer:
-                    binding.has_timer_functions = True
+                    binding.mark_timer(in_recovery)
+                    trigger_timer = True
+    # dc_function_calculate_nextcheck(): trigger timers are seeded with the trigger id,
+    # nodata() function timers with the function id
+    if trigger_timer and trigger.triggerid.isdigit():
+        binding.timer_seed = int(trigger.triggerid)
+    else:
+        for node in binding.history_calls:
+            if node.name == "nodata" and node.funcid and node.funcid.isdigit():
+                binding.timer_seed = int(node.funcid)
+                break
     return binding
 
 
@@ -121,7 +149,9 @@ def _unquote(raw: str) -> str | None:
     return _convert_raw_arg(raw)
 
 
-def _bind_call(node: HistoryCall, trigger: Trigger, resolver: ItemResolver | None, binding: Binding) -> None:
+def _bind_call(
+    node: HistoryCall, trigger: Trigger, resolver: ItemResolver | None, binding: Binding, in_recovery: bool = False
+) -> None:
     spec = HISTORY_FUNCTIONS.get(node.name)
     if spec is None:
         if node.name in UNSUPPORTED_HISTORY_FUNCTIONS or node.name.endswith("_foreach"):
@@ -190,7 +220,9 @@ def _bind_call(node: HistoryCall, trigger: Trigger, resolver: ItemResolver | Non
                 req.merge_seconds(shift_back)
         if node.name == "change":
             req.merge_count(2)
-    if spec.timer or period.shift is not None:
-        binding.has_timer_functions = True
+    if spec.timer:
+        binding.mark_timer(in_recovery)
+    if not in_recovery:
+        binding.problem_itemids.add(item.itemid)
     if not item.is_numeric and spec.source == "trends":
         binding.warnings.append(f"{node.text}: trend functions need a numeric item, {item.ref} is {item.value_type_name}")
