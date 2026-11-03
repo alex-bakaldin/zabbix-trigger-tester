@@ -49,7 +49,8 @@ uv run python diff_test.py     # server engine vs the pure-Python implementation
 | `zt_evaluate_function(itemid, name, params, sec, ns, &value, &error)` | one history function at a timestamp |
 | `zt_evaluate_expression(text, sec, ns, &result, &error)` | whole trigger expression; 0 = value, 1 = UNKNOWN with error, 2 = parse error |
 | `zt_set_now(sec, ns)` | virtual clock (set automatically by the evaluate calls) |
-| `zt_reset()`, `zt_free(ptr)`, `zt_set_debug(flag)`, `zt_zabbix_version()` | housekeeping |
+| `zt_reset()`, `zt_free(ptr)`, `zt_set_debug(flag)` | housekeeping |
+| `zt_zabbix_version()`, `zt_source_tag()` | Zabbix version and git tag the library was built from |
 
 ## Known gaps
 
