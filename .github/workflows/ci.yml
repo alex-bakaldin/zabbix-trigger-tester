@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  python:
+    name: Python engine (${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: uv sync
+      - run: uv run pytest -q
+
+  native:
+    name: Native engine (Zabbix server code)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - name: Build dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential autoconf automake libtool pkg-config libpcre2-dev
+      - name: Cache Zabbix sources
+        uses: actions/cache@v4
+        with:
+          path: /tmp/zabbix-src
+          key: zabbix-${{ hashFiles('native/ZABBIX_TAG') }}
+      - name: Fetch and build Zabbix libraries
+        run: test -f /tmp/zabbix-src/src/libs/zbxeval/libzbxeval.a || native/fetch_sources.sh /tmp/zabbix-src
+      - name: Build libzbxtester.so
+        run: ZABBIX_SRC=/tmp/zabbix-src native/build.sh
+      - run: uv sync
+      - name: Tests (native ones included)
+        run: uv run pytest -q
+      - name: Differential test, native vs Python
+        run: TZ=UTC uv run python native/diff_test.py | tail -1 | tee diff.txt && grep -q " 0 mismatches" diff.txt

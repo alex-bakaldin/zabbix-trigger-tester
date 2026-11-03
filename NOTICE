@@ -1,0 +1,12 @@
+trigger-tester
+Copyright (C) 2026 trigger-tester contributors
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU Affero General Public License as published by the Free
+Software Foundation, version 3 (see LICENSE).
+
+The native evaluation engine in native/ links against unmodified source code of
+Zabbix (https://www.zabbix.com), Copyright (C) 2001-2026 Zabbix SIA, which is
+distributed under the GNU Affero General Public License version 3. The Zabbix
+sources are not bundled; native/fetch_sources.sh downloads the pinned release
+(native/ZABBIX_TAG) from the official repository at build time.
